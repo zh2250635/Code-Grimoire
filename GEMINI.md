@@ -1,1 +1,1 @@
-d:/codes/Code-Grimoire/AGENT.md
+AGENT.md

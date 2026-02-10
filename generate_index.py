@@ -115,7 +115,7 @@ def render(demos: list[dict]) -> str:
 
 
 def main():
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent / "src"
     demos = collect_demos(root)
     out = root / "index.html"
     out.write_text(render(demos), encoding="utf-8")
