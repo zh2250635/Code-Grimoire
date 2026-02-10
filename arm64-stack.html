@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ARM64 调用栈与栈操作演示</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Consolas', 'Monaco', 'Menlo', monospace; }
+
+    .cell-flash { animation: flash 0.5s ease; }
+    @keyframes flash {
+      0%   { background-color: #fbbf24; color: #000; }
+      100% { background-color: transparent; }
+    }
+
+    .reg-flash { animation: regflash 0.5s ease; }
+    @keyframes regflash {
+      0%   { background-color: #34d399; color: #000; }
+      100% { background-color: transparent; }
+    }
+
+    .active-line {
+      background-color: rgba(250, 204, 21, 0.15) !important;
+      border-left-color: #facc15 !important;
+    }
+
+    .sp-marker {
+      position: absolute; right: -52px; top: 50%; transform: translateY(-50%);
+      color: #f87171; font-weight: bold; font-size: 12px; white-space: nowrap;
+    }
+    .fp-marker {
+      position: absolute; right: -52px; top: 50%; transform: translateY(-50%);
+      color: #60a5fa; font-weight: bold; font-size: 12px; white-space: nowrap;
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-200 min-h-screen p-4">
+
+  <div class="max-w-7xl mx-auto">
+    <h1 class="text-2xl font-bold text-center mb-1">ARM64 调用栈与栈操作演示</h1>
+    <p class="text-center text-gray-500 text-sm mb-4">展示 BL/RET、STP/LDP、栈帧分配的完整过程</p>
+
+    <!-- 控制栏 -->
+    <div class="flex items-center justify-center gap-3 mb-5">
+      <button id="btnPrev" onclick="stepPrev()" disabled
+        class="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-30 disabled:cursor-not-allowed rounded text-sm transition-colors">
+        ◀ 上一步
+      </button>
+      <button id="btnNext" onclick="stepNext()"
+        class="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded text-sm font-bold transition-colors">
+        下一步 ▶
+      </button>
+      <button onclick="resetAll()"
+        class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm transition-colors">
+        重置
+      </button>
+      <span class="text-gray-500 text-sm ml-2" id="stepCounter">0 / 0</span>
+    </div>
+
+    <!-- 说明栏 -->
+    <div class="text-center mb-5 h-12 flex items-center justify-center">
+      <div id="desc" class="text-yellow-300 text-sm max-w-2xl leading-relaxed"></div>
+    </div>
+
+    <!-- 三栏布局 -->
+    <div class="grid grid-cols-12 gap-4">
+
+      <!-- 左：代码区 -->
+      <div class="col-span-4">
+        <h2 class="text-sm font-bold text-gray-400 mb-2">汇编代码</h2>
+        <div id="codePanel" class="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden text-xs"></div>
+        <div class="mt-3 text-xs text-gray-600 leading-relaxed">
+          <div><span class="text-purple-400">■</span> main</div>
+          <div><span class="text-green-400">■</span> add_numbers</div>
+        </div>
+      </div>
+
+      <!-- 中：栈内存 -->
+      <div class="col-span-4">
+        <h2 class="text-sm font-bold text-gray-400 mb-2">栈内存 (高地址在上，向下增长 ↓)</h2>
+        <div id="stackPanel" class="bg-gray-900 rounded-lg border border-gray-800 p-3"></div>
+      </div>
+
+      <!-- 右：寄存器 -->
+      <div class="col-span-4">
+        <h2 class="text-sm font-bold text-gray-400 mb-2">关键寄存器</h2>
+        <div id="regPanel" class="bg-gray-900 rounded-lg border border-gray-800 p-3 text-sm"></div>
+        <div class="mt-4">
+          <h2 class="text-sm font-bold text-gray-400 mb-2">调用栈</h2>
+          <div id="callStack" class="bg-gray-900 rounded-lg border border-gray-800 p-3 text-xs"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ============================================================
+//  数据模型
+// ============================================================
+
+// 模拟的代码行
+const CODE = [
+  // main (地址 0x1000 起)
+  { addr: 0x1000, fn: 'main', text: 'SUB  SP, SP, #32',       comment: '分配 main 栈帧 (32 字节)' },
+  { addr: 0x1004, fn: 'main', text: 'STP  X29, X30, [SP]',    comment: '保存 FP 和 LR 到栈顶' },
+  { addr: 0x1008, fn: 'main', text: 'MOV  X29, SP',           comment: '设置新的帧指针 FP = SP' },
+  { addr: 0x100C, fn: 'main', text: 'MOV  W0, #3',            comment: '第一个参数 = 3' },
+  { addr: 0x1010, fn: 'main', text: 'MOV  W1, #5',            comment: '第二个参数 = 5' },
+  { addr: 0x1014, fn: 'main', text: 'STR  W0, [SP, #16]',     comment: '局部变量 a 存入栈' },
+  { addr: 0x1018, fn: 'main', text: 'STR  W1, [SP, #20]',     comment: '局部变量 b 存入栈' },
+  { addr: 0x101C, fn: 'main', text: 'BL   add_numbers',       comment: '调用 add_numbers，LR = 0x1020' },
+  // 返回后继续
+  { addr: 0x1020, fn: 'main', text: 'STR  W0, [SP, #24]',     comment: '保存返回值到栈' },
+  { addr: 0x1024, fn: 'main', text: 'LDP  X29, X30, [SP]',    comment: '恢复 FP 和 LR' },
+  { addr: 0x1028, fn: 'main', text: 'ADD  SP, SP, #32',       comment: '释放 main 栈帧' },
+  { addr: 0x102C, fn: 'main', text: 'RET',                    comment: '返回调用者 (PC = LR)' },
+
+  // add_numbers (地址 0x2000 起)
+  { addr: 0x2000, fn: 'add',  text: 'SUB  SP, SP, #16',       comment: '分配 add_numbers 栈帧' },
+  { addr: 0x2004, fn: 'add',  text: 'STP  X29, X30, [SP]',    comment: '保存 FP 和 LR' },
+  { addr: 0x2008, fn: 'add',  text: 'MOV  X29, SP',           comment: 'FP = SP' },
+  { addr: 0x200C, fn: 'add',  text: 'ADD  W0, W0, W1',        comment: 'W0 = W0 + W1 = 8' },
+  { addr: 0x2010, fn: 'add',  text: 'LDP  X29, X30, [SP]',    comment: '恢复 FP 和 LR' },
+  { addr: 0x2014, fn: 'add',  text: 'ADD  SP, SP, #16',       comment: '释放栈帧' },
+  { addr: 0x2018, fn: 'add',  text: 'RET',                    comment: '返回 main (PC = LR)' },
+];
+
+// 执行步骤：每步描述状态变化
+// regs: 要更新的寄存器, stack: [{addr, val, label}], codeLine: 高亮行索引
+const INIT_SP = 0xFFF0;  // 初始 SP
+const INIT_FP = 0xFFF0;
+const INIT_LR = 0x9000;  // 假设 main 的调用者
+
+const STEPS = [
+  // === main prologue ===
+  {
+    line: 0,
+    desc: 'main 开始：SP 减 32，向下开辟 32 字节的栈帧空间。ARM64 栈向低地址增长。',
+    regs: { SP: INIT_SP - 32, PC: 0x1004 },
+    stackOps: [],
+    callStack: ['main'],
+  },
+  {
+    line: 1,
+    desc: 'STP 将 FP(X29) 和 LR(X30) 成对存入 [SP]。STP = Store Pair，一次写 16 字节。',
+    regs: { PC: 0x1008 },
+    stackOps: [
+      { addr: INIT_SP - 32,     val: '0x' + INIT_FP.toString(16).toUpperCase(), label: '旧 FP (X29)' },
+      { addr: INIT_SP - 32 + 8, val: '0x' + INIT_LR.toString(16).toUpperCase(), label: '旧 LR (X30)' },
+    ],
+    callStack: ['main'],
+  },
+  {
+    line: 2,
+    desc: 'MOV X29, SP — 帧指针指向当前栈帧底部，后续可通过 FP 访问局部变量。',
+    regs: { FP: INIT_SP - 32, PC: 0x100C },
+    stackOps: [],
+    callStack: ['main'],
+  },
+  // === main body ===
+  {
+    line: 3,
+    desc: 'W0 = 3，准备第一个函数参数。ARM64 用 X0-X7 传参。',
+    regs: { W0: 3, PC: 0x1010 },
+    stackOps: [],
+    callStack: ['main'],
+  },
+  {
+    line: 4,
+    desc: 'W1 = 5，准备第二个参数。',
+    regs: { W1: 5, PC: 0x1014 },
+    stackOps: [],
+    callStack: ['main'],
+  },
+  {
+    line: 5,
+    desc: 'STR W0, [SP, #16] — 把参数 a=3 存到栈帧偏移 16 处（局部变量区）。',
+    regs: { PC: 0x1018 },
+    stackOps: [
+      { addr: INIT_SP - 32 + 16, val: '3', label: '局部变量 a' },
+    ],
+    callStack: ['main'],
+  },
+  {
+    line: 6,
+    desc: 'STR W1, [SP, #20] — 把参数 b=5 存到偏移 20 处。',
+    regs: { PC: 0x101C },
+    stackOps: [
+      { addr: INIT_SP - 32 + 20, val: '5', label: '局部变量 b' },
+    ],
+    callStack: ['main'],
+  },
+  // === BL ===
+  {
+    line: 7,
+    desc: 'BL add_numbers — Branch with Link：① LR = 下一条指令地址 (0x1020)  ② PC 跳转到 0x2000',
+    regs: { LR: 0x1020, PC: 0x2000 },
+    stackOps: [],
+    callStack: ['main', 'add_numbers'],
+  },
+  // === add_numbers prologue ===
+  {
+    line: 12,
+    desc: 'add_numbers 入口：SP 减 16，开辟自己的栈帧。注意栈继续向下增长。',
+    regs: { SP: INIT_SP - 32 - 16, PC: 0x2004 },
+    stackOps: [],
+    callStack: ['main', 'add_numbers'],
+  },
+  {
+    line: 13,
+    desc: 'STP 保存当前 FP 和 LR (0x1020) 到新栈帧。这样 add_numbers 返回时能恢复。',
+    regs: { PC: 0x2008 },
+    stackOps: [
+      { addr: INIT_SP - 48,     val: '0x' + (INIT_SP - 32).toString(16).toUpperCase(), label: 'main 的 FP' },
+      { addr: INIT_SP - 48 + 8, val: '0x1020', label: '返回地址 LR' },
+    ],
+    callStack: ['main', 'add_numbers'],
+  },
+  {
+    line: 14,
+    desc: 'FP = SP，帧指针指向 add_numbers 的栈帧。',
+    regs: { FP: INIT_SP - 48, PC: 0x200C },
+    stackOps: [],
+    callStack: ['main', 'add_numbers'],
+  },
+  // === add body ===
+  {
+    line: 15,
+    desc: 'ADD W0, W0, W1 — 计算 3 + 5 = 8，结果放在 W0（也是返回值寄存器）。',
+    regs: { W0: 8, PC: 0x2010 },
+    stackOps: [],
+    callStack: ['main', 'add_numbers'],
+  },
+  // === add epilogue ===
+  {
+    line: 16,
+    desc: 'LDP 恢复 FP 和 LR。LDP = Load Pair，从栈读回之前保存的值。',
+    regs: { FP: INIT_SP - 32, LR: 0x1020, PC: 0x2014 },
+    stackOps: [
+      { addr: INIT_SP - 48,     val: '', label: '' },
+      { addr: INIT_SP - 48 + 8, val: '', label: '' },
+    ],
+    callStack: ['main', 'add_numbers'],
+  },
+  {
+    line: 17,
+    desc: 'ADD SP, SP, #16 — 释放 add_numbers 的栈帧，SP 回到 main 的栈帧。',
+    regs: { SP: INIT_SP - 32, PC: 0x2018 },
+    stackOps: [],
+    callStack: ['main', 'add_numbers'],
+  },
+  {
+    line: 18,
+    desc: 'RET — PC = LR (0x1020)，跳回 main 中 BL 的下一条指令。函数返回完成。',
+    regs: { PC: 0x1020 },
+    stackOps: [],
+    callStack: ['main'],
+  },
+  // === back in main ===
+  {
+    line: 8,
+    desc: '回到 main：把返回值 W0=8 存入栈偏移 24 处。',
+    regs: { PC: 0x1024 },
+    stackOps: [
+      { addr: INIT_SP - 32 + 24, val: '8', label: '返回值 result' },
+    ],
+    callStack: ['main'],
+  },
+  {
+    line: 9,
+    desc: 'LDP 恢复 main 的旧 FP 和 LR，准备返回。',
+    regs: { FP: INIT_FP, LR: INIT_LR, PC: 0x1028 },
+    stackOps: [
+      { addr: INIT_SP - 32,     val: '', label: '' },
+      { addr: INIT_SP - 32 + 8, val: '', label: '' },
+    ],
+    callStack: ['main'],
+  },
+  {
+    line: 10,
+    desc: 'ADD SP, SP, #32 — 释放 main 栈帧，SP 恢复到初始值。栈完全清空。',
+    regs: { SP: INIT_SP, PC: 0x102C },
+    stackOps: [
+      // 清除 main 局部变量区
+      { addr: INIT_SP - 32 + 16, val: '', label: '' },
+      { addr: INIT_SP - 32 + 20, val: '', label: '' },
+      { addr: INIT_SP - 32 + 24, val: '', label: '' },
+    ],
+    callStack: ['main'],
+  },
+  {
+    line: 11,
+    desc: 'RET — main 返回，PC = LR (0x9000)。整个调用流程结束。',
+    regs: { PC: INIT_LR },
+    stackOps: [],
+    callStack: [],
+  },
+];
+
+// ============================================================
+//  状态
+// ============================================================
+let currentStep = -1;
+let regs = { SP: INIT_SP, FP: INIT_FP, LR: INIT_LR, PC: 0x1000, W0: 0, W1: 0 };
+let stackMem = {}; // addr -> { val, label }
+let history = [];  // 用于回退: [{regs, stackMem}]
+
+// ============================================================
+//  渲染：代码面板
+// ============================================================
+function renderCode() {
+  const panel = document.getElementById('codePanel');
+  let html = '';
+  let lastFn = '';
+  CODE.forEach((c, i) => {
+    if (c.fn !== lastFn) {
+      const name = c.fn === 'main' ? 'main:' : 'add_numbers:';
+      const color = c.fn === 'main' ? 'text-purple-400' : 'text-green-400';
+      html += `<div class="px-3 py-1 ${color} font-bold bg-gray-800/50 border-b border-gray-800">${name}</div>`;
+      lastFn = c.fn;
+    }
+    const active = (currentStep >= 0 && STEPS[currentStep].line === i) ? 'active-line' : '';
+    const addr = '0x' + c.addr.toString(16).toUpperCase();
+    html += `<div id="code-${i}" class="flex items-start px-3 py-1 border-l-2 border-transparent ${active} hover:bg-gray-800/30">`;
+    html += `<span class="text-gray-600 w-14 shrink-0">${addr}</span>`;
+    html += `<span class="text-gray-200 w-44 shrink-0">${c.text}</span>`;
+    html += `<span class="text-gray-500 text-xs leading-5">; ${c.comment}</span>`;
+    html += `</div>`;
+  });
+  panel.innerHTML = html;
+
+  // 滚动到当前行
+  if (currentStep >= 0) {
+    const el = document.getElementById('code-' + STEPS[currentStep].line);
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+// ============================================================
+//  渲染：栈内存
+// ============================================================
+function renderStack(changedAddrs = []) {
+  const panel = document.getElementById('stackPanel');
+  // 显示范围：从 INIT_SP - 48 到 INIT_SP (每 8 字节一行，共 7 行)
+  const low = INIT_SP - 48;
+  const high = INIT_SP;
+  let html = '<div class="text-xs space-y-0">';
+
+  for (let addr = high - 8; addr >= low; addr -= 8) {
+    const cell = stackMem[addr];
+    const val = cell ? cell.val : '';
+    const label = cell ? cell.label : '';
+    const addrStr = '0x' + addr.toString(16).toUpperCase();
+    const isEmpty = !val;
+    const isChanged = changedAddrs.includes(addr);
+
+    // SP / FP 标记
+    let markers = '';
+    if (addr === regs.SP && addr === regs.FP) {
+      markers = '<span class="sp-marker">← SP,FP</span>';
+    } else if (addr === regs.SP) {
+      markers = '<span class="sp-marker">← SP</span>';
+    } else if (addr === regs.FP) {
+      markers = '<span class="fp-marker">← FP</span>';
+    }
+
+    // 栈帧着色
+    let frameBorder = 'border-gray-800';
+    if (!isEmpty) {
+      // 判断属于哪个栈帧
+      if (addr >= INIT_SP - 32) frameBorder = 'border-purple-800/50';
+      else frameBorder = 'border-green-800/50';
+    }
+
+    const flashClass = isChanged ? 'cell-flash' : '';
+
+    html += `<div class="relative flex items-center border-b ${frameBorder} py-1.5 px-2 ${flashClass}">`;
+    html += `<span class="text-gray-600 w-16 shrink-0">${addrStr}</span>`;
+    html += `<span class="w-20 text-center font-bold ${isEmpty ? 'text-gray-700' : 'text-yellow-300'}">${val || '—'}</span>`;
+    html += `<span class="text-gray-500 text-xs ml-2">${label}</span>`;
+    html += markers;
+    html += `</div>`;
+  }
+
+  html += '</div>';
+  panel.innerHTML = html;
+}
+
+// ============================================================
+//  渲染：寄存器
+// ============================================================
+function renderRegs(changedKeys = []) {
+  const panel = document.getElementById('regPanel');
+  const defs = [
+    { key: 'PC',  name: 'PC (程序计数器)',  color: 'text-yellow-300' },
+    { key: 'SP',  name: 'SP (栈指针)',      color: 'text-red-400' },
+    { key: 'FP',  name: 'X29 / FP (帧指针)', color: 'text-blue-400' },
+    { key: 'LR',  name: 'X30 / LR (链接寄存器)', color: 'text-green-400' },
+    { key: 'W0',  name: 'W0 (参数/返回值)',  color: 'text-orange-300' },
+    { key: 'W1',  name: 'W1 (参数)',         color: 'text-orange-300' },
+  ];
+
+  let html = '<div class="space-y-1">';
+  defs.forEach(d => {
+    const v = regs[d.key];
+    const display = typeof v === 'number' && v > 255 ? '0x' + v.toString(16).toUpperCase() : String(v);
+    const flash = changedKeys.includes(d.key) ? 'reg-flash' : '';
+    html += `<div class="flex justify-between items-center py-1 px-2 rounded ${flash}">`;
+    html += `<span class="text-gray-400 text-xs">${d.name}</span>`;
+    html += `<span class="${d.color} font-bold">${display}</span>`;
+    html += `</div>`;
+  });
+  html += '</div>';
+  panel.innerHTML = html;
+}
+
+// ============================================================
+//  渲染：调用栈
+// ============================================================
+function renderCallStack(stack) {
+  const panel = document.getElementById('callStack');
+  if (!stack || stack.length === 0) {
+    panel.innerHTML = '<div class="text-gray-600 text-center py-2">(空)</div>';
+    return;
+  }
+  let html = '';
+  stack.slice().reverse().forEach((fn, i) => {
+    const isTop = i === 0;
+    const bg = isTop ? 'bg-yellow-900/30 border-yellow-700/50' : 'bg-gray-800/50 border-gray-700/50';
+    html += `<div class="px-3 py-1.5 border rounded mb-1 ${bg}">`;
+    html += `${isTop ? '▶ ' : '  '}${fn}`;
+    html += `</div>`;
+  });
+  panel.innerHTML = html;
+}
+
+// ============================================================
+//  步进逻辑
+// ============================================================
+function applyStep(step) {
+  const changedRegs = [];
+  const changedAddrs = [];
+
+  // 更新寄存器
+  if (step.regs) {
+    for (const [k, v] of Object.entries(step.regs)) {
+      if (regs[k] !== v) changedRegs.push(k);
+      regs[k] = v;
+    }
+  }
+
+  // 更新栈
+  if (step.stackOps) {
+    step.stackOps.forEach(op => {
+      changedAddrs.push(op.addr);
+      if (op.val === '') {
+        delete stackMem[op.addr];
+      } else {
+        stackMem[op.addr] = { val: op.val, label: op.label };
+      }
+    });
+  }
+
+  return { changedRegs, changedAddrs };
+}
+
+function stepNext() {
+  if (currentStep >= STEPS.length - 1) return;
+
+  // 保存快照用于回退
+  history.push({
+    regs: { ...regs },
+    stackMem: JSON.parse(JSON.stringify(stackMem)),
+  });
+
+  currentStep++;
+  const step = STEPS[currentStep];
+  const { changedRegs, changedAddrs } = applyStep(step);
+
+  renderCode();
+  renderStack(changedAddrs);
+  renderRegs(changedRegs);
+  renderCallStack(step.callStack);
+  document.getElementById('desc').textContent = step.desc;
+  updateButtons();
+}
+
+function stepPrev() {
+  if (currentStep < 0 || history.length === 0) return;
+
+  const snapshot = history.pop();
+  regs = snapshot.regs;
+  stackMem = snapshot.stackMem;
+  currentStep--;
+
+  if (currentStep >= 0) {
+    const step = STEPS[currentStep];
+    renderCode();
+    renderStack();
+    renderRegs();
+    renderCallStack(step.callStack);
+    document.getElementById('desc').textContent = step.desc;
+  } else {
+    renderCode();
+    renderStack();
+    renderRegs();
+    renderCallStack([]);
+    document.getElementById('desc').textContent = '点击「下一步」开始演示';
+  }
+  updateButtons();
+}
+
+function resetAll() {
+  currentStep = -1;
+  regs = { SP: INIT_SP, FP: INIT_FP, LR: INIT_LR, PC: 0x1000, W0: 0, W1: 0 };
+  stackMem = {};
+  history = [];
+  renderCode();
+  renderStack();
+  renderRegs();
+  renderCallStack([]);
+  document.getElementById('desc').textContent = '点击「下一步」开始演示';
+  updateButtons();
+}
+
+function updateButtons() {
+  document.getElementById('btnPrev').disabled = currentStep < 0;
+  document.getElementById('btnNext').disabled = currentStep >= STEPS.length - 1;
+  document.getElementById('stepCounter').textContent = `${currentStep + 1} / ${STEPS.length}`;
+}
+
+// ============================================================
+//  键盘快捷键
+// ============================================================
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); stepNext(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); stepPrev(); }
+  if (e.key === 'r') resetAll();
+});
+
+// ============================================================
+//  初始化
+// ============================================================
+renderCode();
+renderStack();
+renderRegs();
+renderCallStack([]);
+updateButtons();
+document.getElementById('desc').textContent = '点击「下一步」开始演示，或按 → / 空格 前进，← 后退，R 重置';
+</script>
+</body>
+</html>
