@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CE 底层调试状态机流转图</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        bgDark: '#1e1e1e',
+                        panelBtn: '#0e639c',
+                        panelBtnHover: '#1177bb',
+                        highlight: '#ffd700',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: 'Consolas', 'Monaco', monospace; overflow-x: hidden; }
+        .node {
+            transition: all 0.5s ease;
+            opacity: 0.3;
+            transform: scale(0.95);
+        }
+        .node.active {
+            opacity: 1;
+            transform: scale(1.05);
+            box-shadow: 0 0 20px rgba(255, 215, 0, 0.4);
+            border-color: #ffd700;
+            z-index: 20;
+        }
+        .node.done {
+            opacity: 0.8;
+            transform: scale(1);
+        }
+        path {
+            stroke-dasharray: 10;
+            animation: dash 1s linear infinite;
+        }
+        path.static-path {
+            animation: none;
+        }
+        @keyframes dash {
+            to { stroke-dashoffset: -20; }
+        }
+        /* 避免文本选中 */
+        .no-select {
+            user-select: none;
+        }
+    </style>
+</head>
+<body class="bg-bgDark text-gray-300 flex flex-col items-center py-8 px-4 min-h-screen">
+
+    <h2 class="text-2xl font-bold mb-6 text-white text-shadow text-center">CE 底层硬件断点单步调试状态机</h2>
+    
+    <div class="bg-[#2d2d2d] p-4 rounded-lg shadow-lg border border-gray-700 mb-8 z-50 sticky top-4 w-full max-w-2xl">
+        <div class="flex space-x-4 justify-center relative">
+            <button id="startBtn" onclick="runSimulation()" class="bg-panelBtn hover:bg-panelBtnHover text-white px-6 py-2 rounded font-bold transition-all shadow-md">开始调试</button>
+            <button id="stepBtn" onclick="nextStep()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded font-bold transition-all shadow-md">下一步 (Step)</button>
+            <button id="resetBtn" onclick="resetSimulation()" class="bg-gray-600 hover:bg-gray-500 text-white px-6 py-2 rounded font-bold transition-all shadow-md">结束调试</button>
+        </div>
+        <div class="mt-4 text-highlight font-bold text-center h-6 text-sm" id="statusText" style="text-shadow: 0 0 5px rgba(255, 215, 0, 0.3);">点击“开始调试”自动播放，或点击“下一步”手动步进...</div>
+    </div>
+
+    <!-- 图表区域 -->
+    <div class="relative w-full max-w-2xl flex flex-col items-center space-y-6 pb-20 no-select" id="flowchart">
+        <!-- SVG 连线层 -->
+        <svg class="absolute inset-0 w-full h-full pointer-events-none z-0 overflow-visible" id="svgLayer">
+            <!-- 连线在 JS 中动态生成 -->
+        </svg>
+
+        <!-- 节点定义 -->
+        <div class="node bg-green-900 border-2 border-green-700 p-4 rounded-lg w-3/4 text-center z-10 shadow-lg" id="n0">
+            <div class="font-bold text-green-100 text-lg">附加与启动</div>
+            <div class="text-green-300 text-xs mt-2">Attach 进程 -> 写入硬件调试寄存器 (下发断点) -> 恢复全速运行</div>
+        </div>
+
+        <!-- 循环区域包裹器 -->
+        <div class="w-[90%] flex justify-center py-4 relative z-10 border-dashed border-2 transition-colors duration-500 border-gray-600 rounded-xl flex-col items-center" id="loop-container" style="margin-top: 30px; margin-bottom: 30px;">
+            <div class="absolute -top-3 left-6 bg-bgDark px-2 text-gray-400 text-xs tracking-wider font-bold" id="loop-title">核心监控循环 (CE 死循环逻辑)</div>
+            
+            <div class="flex flex-col items-center space-y-8 w-full py-4">
+                <div class="node bg-red-900 border-2 border-red-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-lg" id="n1">
+                    <div class="font-bold text-red-100">[A] 事件触发</div>
+                    <div class="text-red-300 text-xs mt-1">(硬件断点命中，内核抛出 SIGTRAP，暂停线程)</div>
+                </div>
+
+                <div class="node bg-blue-900 border-2 border-blue-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-md" id="n2">
+                    <div class="font-bold text-blue-100">[B] 获取线程上下文</div>
+                    <div class="text-blue-300 text-xs mt-1">(读取寄存器，解析发生写操作的地址及当前 PC)</div>
+                </div>
+
+                <div class="node bg-blue-900 border-2 border-blue-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-md" id="n3">
+                    <div class="font-bold text-blue-100">[C] 设置线程上下文</div>
+                    <div class="text-blue-300 text-xs mt-1">(修改 CPU 标志位，如 ARM64 PSTATE.SS 或 x86 TF 位)</div>
+                </div>
+
+                <div class="node bg-blue-900 border-2 border-blue-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-md" id="n4">
+                    <div class="font-bold text-blue-100">[D] 取消断点</div>
+                    <div class="text-blue-300 text-xs mt-1">(临时清空硬件调试寄存器：撤防)</div>
+                </div>
+
+                <div class="node bg-blue-900 border-2 border-blue-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-md" id="n5">
+                    <div class="font-bold text-blue-100">[E] 发送继续调试</div>
+                    <div class="text-blue-300 text-xs mt-1">(内核唤醒线程，因设置了 TF/SS，CPU 准备单步)</div>
+                </div>
+
+                <div class="node bg-red-900 border-2 border-red-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-lg" id="n6">
+                    <div class="font-bold text-red-100">[F] CPU 执行原指令</div>
+                    <div class="text-red-300 text-xs mt-1">(仅执行一条指令后，再次触发单步 Trap 事件)</div>
+                </div>
+
+                <div class="node bg-blue-900 border-2 border-blue-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-md" id="n7">
+                    <div class="font-bold text-blue-100">[G] 断点回挂</div>
+                    <div class="text-blue-300 text-xs mt-1">(将监控地址重新写入硬件调试寄存器：重新布防)</div>
+                </div>
+
+                <div class="node bg-blue-900 border-2 border-blue-700 p-4 rounded-lg w-[85%] text-center z-10 shadow-md" id="n8">
+                    <div class="font-bold text-blue-100">[H] 发送继续调试</div>
+                    <div class="text-blue-300 text-xs mt-1">(清理单步标志，内核唤醒线程，全速运行)</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="node bg-gray-800 border-2 border-gray-600 p-4 rounded-lg w-3/4 text-center z-10 shadow-lg relative" id="n9">
+            <div class="absolute -top-3 right-6 bg-bgDark px-2 text-gray-500 text-xs">用户主动中止</div>
+            <div class="font-bold text-gray-200 text-lg">清理与分离</div>
+            <div class="text-gray-400 text-xs mt-2">永久移除硬件断点 -> Detach 分离调试器 -> 目标完全自由</div>
+        </div>
+    </div>
+
+    <script>
+        const nodes = ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9'];
+        const connections = [
+            {from: 'n0', to: 'n1', type: 'normal'},
+            {from: 'n1', to: 'n2', type: 'normal'},
+            {from: 'n2', to: 'n3', type: 'normal'},
+            {from: 'n3', to: 'n4', type: 'normal'},
+            {from: 'n4', to: 'n5', type: 'normal'},
+            {from: 'n5', to: 'n6', type: 'normal'},
+            {from: 'n6', to: 'n7', type: 'normal'},
+            {from: 'n7', to: 'n8', type: 'normal'},
+            {from: 'n8', to: 'n1', type: 'loop'},
+            {from: 'n8', to: 'n9', type: 'exit'}
+        ];
+
+        let currentStepList = [];
+        let curIdx = -1;
+        let isAutoPlay = false;
+
+        const messages = {
+            'n0': "[初始化] 调试器附加进程，写入硬件调试寄存器下发断点，恢复程序运行。",
+            'n1': "[触发拦截] 目标访问到断点地址，CPU抛出异常，内核转化为SIGTRAP，线程暂停运行。",
+            'n2': "[状态获取] 调试器读取全部寄存器，获得触发断点的内存地址和当前汇编位置(PC)。",
+            'n3': "[关键修改] 调试器通过修改标志位(如x86的TF或ARM64的PSTATE.SS)，告诉CPU下一条指令要单步执行。",
+            'n4': "[临时放行] 为了让断点所在的原指令能够顺利执行，必须临时将硬件断点清空。",
+            'n5': "[单步执行] 调试器通知内核唤醒线程。CPU 准备仅执行一条指令就再次停下。",
+            'n6': "[二次拦截] 原指令刚执行完，由于有单步标志，CPU立刻产生新的异常，线程再次停下。",
+            'n7': "[布防恢复] 原指令已经执行过了，现在需要把之前清掉的硬件断点重新写进调试寄存器。",
+            'n8': "[放行起飞] 取消掉单步标志位，并唤醒线程，程序恢复全速运行，等待下一次访问断点。",
+            'n9': "[调试结束] 用户手动结束调试，所有修改会被还原，分离进程，游戏/程序正常执行下去。"
+        };
+
+        function drawLines() {
+            const svg = document.getElementById('svgLayer');
+            svg.innerHTML = `
+                <defs>
+                    <marker id="arrowhead" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                        <polygon points="0 0, 6 3, 0 6" fill="#ffd700" />
+                    </marker>
+                    <marker id="arrowhead-gray" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                        <polygon points="0 0, 6 3, 0 6" fill="#555" />
+                    </marker>
+                </defs>
+            `;
+            
+            const layout = document.getElementById('flowchart').getBoundingClientRect();
+            
+            connections.forEach((conn) => {
+                const f = document.getElementById(conn.from);
+                const t = document.getElementById(conn.to);
+                if (!f || !t) return;
+
+                const fr = f.getBoundingClientRect();
+                const tr = t.getBoundingClientRect();
+                
+                let sx, sy, ex, ey, pathData;
+
+                if (conn.type === 'normal' || conn.type === 'exit') {
+                    sx = fr.left + fr.width / 2 - layout.left;
+                    sy = fr.bottom - layout.top;
+                    ex = tr.left + tr.width / 2 - layout.left;
+                    ey = tr.top - layout.top - 2; // Offset for marker
+
+                    pathData = `M ${sx} ${sy} L ${ex} ${ey}`;
+                } else if (conn.type === 'loop') {
+                    // Loop from right side of H to right side of A
+                    const nodeWidth = fr.width;
+                    sx = fr.right - layout.left;
+                    sy = (fr.top + fr.bottom) / 2 - layout.top;
+                    
+                    ex = tr.right - layout.left;
+                    ey = (tr.top + tr.bottom) / 2 - layout.top;
+                    
+                    const controlX = sx + Math.max(80, nodeWidth * 0.15);
+                    
+                    pathData = `M ${sx} ${sy} C ${controlX} ${sy}, ${controlX} ${ey}, ${ex + 2} ${ey}`;
+                }
+
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.id = `path-${conn.from}-${conn.to}`;
+                path.setAttribute('d', pathData);
+                path.setAttribute('fill', 'none');
+                path.setAttribute('stroke-width', '2');
+                path.setAttribute('stroke', '#555');
+                path.setAttribute('class', 'static-path');
+                
+                if (conn.type === 'exit') {
+                    path.setAttribute('stroke-dasharray', '5,5');
+                }
+                
+                path.setAttribute('marker-end', 'url(#arrowhead-gray)');
+                svg.appendChild(path);
+            });
+        }
+
+        window.addEventListener('load', () => {
+            // Wait slightly for fonts/styles to stabilize bounding boxes
+            setTimeout(() => {
+                drawLines();
+                resetSimulation();
+            }, 100);
+        });
+        
+        window.addEventListener('resize', () => {
+            drawLines();
+            // re-apply path active colors if needed
+            if(curIdx > 0) setActive(currentStepList[curIdx], true);
+        });
+
+        function resetSimulation() {
+            isAutoPlay = false;
+            curIdx = -1;
+            
+            // Simulation sequence
+            currentStepList = ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n1-loop', 'n9'];
+            
+            nodes.forEach(n => {
+                const el = document.getElementById(n);
+                if(el) {
+                    el.classList.remove('active', 'done');
+                }
+            });
+
+            // Reset loop container styling
+            const lc = document.getElementById('loop-container');
+            if(lc) {
+                lc.style.borderColor = '#4b5563'; // gray-600
+                lc.style.boxShadow = 'none';
+                document.getElementById('loop-title').style.color = '#9ca3af';
+            }
+
+            // Reset all paths
+            const svg = document.getElementById('svgLayer');
+            svg.querySelectorAll('path').forEach(p => {
+                p.setAttribute('stroke', '#555');
+                p.setAttribute('marker-end', 'url(#arrowhead-gray)');
+                p.classList.add('static-path');
+            });
+
+            document.getElementById('statusText').innerText = "处于初始状态。点击“开始调试”或“下一步”。";
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stepBtn').disabled = false;
+        }
+
+        function setActive(stepName, isResizeRefresh = false) {
+            if (!isResizeRefresh) {
+                // Clear active from all
+                nodes.forEach(n => {
+                    const el = document.getElementById(n);
+                    if(el) {
+                        if (el.classList.contains('active')) {
+                            el.classList.remove('active');
+                            el.classList.add('done');
+                        }
+                    }
+                });
+
+                // Reset thick gold highlight from all paths
+                const svg = document.getElementById('svgLayer');
+                svg.querySelectorAll('path').forEach(p => {
+                    if (p.getAttribute('stroke') === '#ffd700') {
+                        // preserve its normal gray
+                        p.setAttribute('stroke', '#555');
+                        p.setAttribute('marker-end', 'url(#arrowhead-gray)');
+                        p.classList.add('static-path');
+                    }
+                });
+            }
+
+            const trueNodeId = stepName === 'n1-loop' ? 'n1' : stepName;
+            
+            // Light up current node
+            const el = document.getElementById(trueNodeId);
+            if(el) {
+                el.classList.add('active');
+                el.classList.remove('done');
+            }
+
+            // Light up path from previous
+            if (curIdx > 0 || isResizeRefresh) {
+                let curr = currentStepList[curIdx];
+                let prev = currentStepList[curIdx - 1];
+                
+                let fromNode = prev === 'n1-loop' ? 'n1' : prev;
+                let toNode = trueNodeId;
+                
+                if (curr === 'n1-loop') {
+                    fromNode = 'n8';
+                    toNode = 'n1';
+                } else if (curr === 'n9') {
+                    fromNode = 'n8';
+                }
+
+                const path = document.getElementById(`path-${fromNode}-${toNode}`);
+                if (path) {
+                    path.setAttribute('stroke', '#ffd700');
+                    path.setAttribute('marker-end', 'url(#arrowhead)');
+                    path.classList.remove('static-path');
+                }
+            }
+
+            if (!isResizeRefresh) {
+                document.getElementById('statusText').innerText = messages[trueNodeId] || "执行中...";
+            }
+            
+            // Check loop
+            const loopIds = ['n1','n2','n3','n4','n5','n6','n7','n8'];
+            const lc = document.getElementById('loop-container');
+            if (loopIds.includes(trueNodeId)) {
+                lc.style.borderColor = '#ffd700'; // highlight gold
+                lc.style.boxShadow = '0 0 15px rgba(255,215,0,0.15)';
+                document.getElementById('loop-title').style.color = '#ffd700';
+            } else {
+                lc.style.borderColor = '#4b5563'; // gray-600
+                lc.style.boxShadow = 'none';
+                document.getElementById('loop-title').style.color = '#9ca3af';
+            }
+            
+            // Exit condition
+            if (stepName === 'n9') {
+                if (!isResizeRefresh) {
+                    document.getElementById('startBtn').disabled = true;
+                    document.getElementById('stepBtn').disabled = true;
+                    isAutoPlay = false;
+                }
+            }
+        }
+
+        async function nextStep() {
+            if (curIdx >= currentStepList.length - 1) {
+                resetSimulation();
+                return;
+            }
+            curIdx++;
+            setActive(currentStepList[curIdx]);
+        }
+
+        async function runSimulation() {
+            if (curIdx >= currentStepList.length - 1) {
+                resetSimulation();
+            }
+            isAutoPlay = true;
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stepBtn').disabled = true;
+
+            const delayAmount = 1000; // 动画更慢一点方便阅读
+            while(isAutoPlay && curIdx < currentStepList.length - 1) {
+                curIdx++;
+                setActive(currentStepList[curIdx]);
+                if (curIdx < currentStepList.length - 1) {
+                    await new Promise(r => setTimeout(r, delayAmount));
+                }
+            }
+        }
+    </script>
+</body>
+</html>
